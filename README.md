@@ -35,7 +35,7 @@ Generate few-shot learning task.
 $ cd Mini
 $ python miniimagenet_make_task.py
 ```
-To run the code, see examples in Omni/mini_auto_1shot.py and Mini/mini_auto_5shot.py.
+To run the code, see examples in Mini/mini_auto_1shot.py and Mini/mini_auto_5shot.py.
 Automated training and test fuzzymeta on 1-shot task.
 ```bash
 $ python mini_auto_1shot.py
