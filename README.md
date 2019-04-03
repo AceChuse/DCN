@@ -1,4 +1,4 @@
-# Fuzzy-Parameter-Mapping-Rules
+# Multi-Heads-Parameter-Mapping
 
 This repo contains code accompaning the paper. It includes code for running the few-shot supervised learning domain experiments, including sinusoid regression, Omniglot classification, and MiniImagenet classification.
 
