@@ -13,6 +13,17 @@ import random
 from parallel import *
 import torch.optim as optim
 from torch.optim.lr_scheduler import *
+from bisect import bisect_right
+
+torch.cuda.set_device(0)
+
+use_cuda = torch.cuda.is_available()
+device = torch.device("cuda" if use_cuda else "cpu")
+
+FloatTensor = torch.cuda.FloatTensor if use_cuda else torch.FloatTensor
+LongTensor = torch.cuda.LongTensor if use_cuda else torch.LongTensor
+
+torch.backends.cudnn.benchmark = True
 
 
 def print_network(model, name):
@@ -38,6 +49,20 @@ def printl(strin,end='\n'):
     with open(resultpath, "a") as log:
         log.write(str(strin)+end)
     print(strin,end=end)
+
+
+class Printl(object):
+    def __init__(self, path):
+        self.path = path
+
+    def __call__(self, strin,end='\n'):
+        with open(self.path, "a") as log:
+            log.write(str(strin) + end)
+        print(strin, end=end)
+
+    def clear(self):
+        with open(self.path, "w") as log:
+            log.write("")
 
 
 class Scheduler(object):
@@ -100,7 +125,7 @@ class MSCCALR(object):
         return self.rate
 
     def see(self, s):
-        if -2 <= ((self.epoch - self.milestones2) % self.interval - self.interval) <= 2:
+        if -4 <= ((self.epoch - self.milestones2) % self.interval - self.interval) <= 4 or (self.epoch - self.milestones2) % self.interval == 0:
             printl(s)
             printl('Scheduler epoch=%d, rate=%.6f' % (self.epoch, self.rate))
 
@@ -128,6 +153,32 @@ class MSCCALR2(MSCCALR):
             return self.cyclic_annealing(epoch)
 
 
+class CCALR(object):
+    """
+    Multi-Step + Cyclic Cosine Annealing.
+    """
+    def __init__(self, alpha0=1., interval=2000):
+        self.alpha0 = alpha0 / 2.
+        self.interval = interval
+        self.milestones2 = 0
+
+    def __call__(self, epoch):
+        self.epoch = epoch
+        self.rate = self.alpha0 * (1 + math.cos(
+            math.pi * (self.epoch % self.interval) / self.interval))
+        return self.rate
+
+    def see(self, s):
+        if -2 <= ((self.epoch - self.milestones2) % self.interval - self.interval) <= 2:
+            printl(s)
+            printl('Scheduler epoch=%d, rate=%.6f' % (self.epoch, self.rate))
+
+    def __repr__(self):
+        return self.__class__.__name__ + '(' \
+            + 'alpha0=' + str(self.alpha0 * 2.) + ',' \
+            + 'interval=' + str(self.interval) + ')'
+
+
 class View(nn.Module):
 
     def __init__(self,*size):
@@ -140,6 +191,52 @@ class View(nn.Module):
 
     def extra_repr(self):
         return 'size={size}'.format(**self.__dict__)
+
+
+class Transpose(nn.Module):
+
+    def __init__(self, dim0, dim1):
+        super(Transpose, self).__init__()
+        self.dim0 = dim0
+        self.dim1 = dim1
+
+    def forward(self, x):
+        return x.transpose(self.dim0,self.dim1).contiguous()
+
+    def extra_repr(self):
+        return 'dim0={dim0}, dim1={dim1}'.format(**self.__dict__)
+
+
+class ViewNonFT(nn.Module):
+
+    def __init__(self,*size):
+        super(ViewNonFT, self).__init__()
+        self.size = size
+
+    def forward(self, x):
+        return x.view(x.size(0), *self.size)
+
+    def extra_repr(self):
+        return 'size={size}'.format(**self.__dict__)
+
+
+class SeqMatch(nn.Sequential):
+    def __init__(self, *args):
+        super(SeqMatch, self).__init__(*args)
+
+    def forward(self, x):
+        input_size = x.size()
+        if len(input_size) == 4:
+            return self.call(x.view(input_size[0] * input_size[1], 1, input_size[-2], input_size[-1])
+                             ).view(input_size[0], self.in_channels, 1, -1).mean(0)
+        elif len(input_size) == 5:
+            return self.call(x.view(input_size[0] * input_size[1] * input_size[2], 1, input_size[-2], input_size[-1])
+                             ).view(input_size[0], input_size[1] * input_size[2], 1, -1).mean(0)
+
+    def call(self, x):
+        for module in self._modules.values():
+            x = module(x)
+        return F.hardtanh(x) / 2. + 0.5
 
 
 class _Capsule(nn.Module):
@@ -155,6 +252,41 @@ class _Capsule(nn.Module):
             c = F.softmax(b, 2)
         v = squash(torch.sum(u_hat * c, dim=1), dim=1)
         return v.unsqueeze(1) / 2. + 0.5
+
+
+class CapsuleMatch(_Capsule):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1,
+                 padding=0, dilation=1, bias=True, routings=3, retain_grad=False):
+        super(CapsuleMatch, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=kernel_size, stride=stride,
+                              padding=padding, dilation=dilation, bias=bias)
+        self.routings = routings
+        self.retain_grad = retain_grad
+        b = Variable(torch.zeros(1, 1, self.conv.out_channels)).type(FloatTensor)
+        self.c = F.softmax(b, 2)
+
+    def forward(self, x):
+        input_size = x.size()
+        u_hat = self.conv(x.view(input_size[0] * input_size[1] * input_size[2], self.conv.in_channels, input_size[-2], input_size[-1])
+                          ).view(input_size[0], input_size[1], input_size[2], self.conv.out_channels, -1
+                                 ).permute(1,2,0,4,3).reshape(input_size[1] * input_size[2], -1, self.conv.out_channels)
+        return self.rout(u_hat, self.conv.out_channels)
+
+
+class CapPred(nn.Sequential):
+    def __init__(self, *args):
+        super(CapPred, self).__init__(*args)
+
+    def forward(self, x):
+        input_size = x.size()
+        x = self.call(x.view(input_size[0] * input_size[1] * input_size[2], 1, input_size[-2], input_size[-1]))
+        output_size = x.size()
+        return x.view(input_size[0], input_size[1], input_size[2], output_size[-3], output_size[-2], output_size[-1])
+
+    def call(self, x):
+        for module in self._modules.values():
+            x = module(x)
+        return x
 
 
 class CapChMatch(_Capsule):
@@ -187,6 +319,11 @@ class CapChMatch(_Capsule):
         u_hat = u.permute(1,3,0,2,4,5).reshape(
             input_size[1] * self.k_len, -1, self.set_num)
 
+        '''
+        u_hat = torch.sum(u.view(input_size[0], input_size[1], self.in_channels,
+                       self.k_len, -1, self.set_num),4).permute(1, 3, 0, 2, 4).reshape(
+            input_size[1] * self.k_len, -1, self.set_num)
+        '''
         return self.rout(u_hat, self.set_num)
 
     def extra_repr(self):
@@ -205,6 +342,7 @@ class CapChMatchShell(nn.Module):
         self.dilation = pair(dilation)
 
     def forward(self, x):
+        #print(x.size())
         inp_size = x.size()[-2:]
         row_size = inp_size[0] + 2 * self.padding[0]
         column_size = inp_size[1] + 2 * self.padding[1]
@@ -225,6 +363,35 @@ class CapChMatchShell(nn.Module):
         return self.match(x, self.indexm, self.padding)
 
 
+# class NoMatch(nn.Module):
+#     def __init__(self):
+#         super(NoMatch, self).__init__()
+#
+#     def forward(self, site):
+#         return torch.sigmoid(self.weight[site[0]:site[1]])
+
+
+class EachMatch(nn.Module):
+    def __init__(self, set_num):
+        super(EachMatch, self).__init__()
+        self.set_num = set_num
+        self.start = 0
+        self.end = 0
+
+    def add_field(self, num):
+        self.start = self.end
+        self.end += num
+        return self.start, self.end
+
+    def init_params(self):
+        self.weight = Parameter(torch.Tensor(self.end, 1, self.set_num))
+        stdv = 1. / np.sqrt(self.set_num)
+        self.weight.data.uniform_(-stdv, stdv)
+
+    def forward(self, site):
+        return torch.sigmoid(self.weight[site[0]:site[1]])
+
+
 def margin_loss(inpt, target, m_plus=0.9, m_minus=0.1,lambd=0.5, reduction='elementwise_mean'):
     byte = torch.ones_like(inpt).type(ByteTensor)
     batch_size = target.size(0)
@@ -238,6 +405,56 @@ def margin_loss(inpt, target, m_plus=0.9, m_minus=0.1,lambd=0.5, reduction='elem
     elif reduction == 'none':
         return (F.relu(m_plus - inpt.gather(1, target.unsqueeze(1))) ** 2)[:,0] + \
                lambd * torch.sum(F.relu(inpt[byte] - m_minus).view(batch_size, -1) ** 2, dim=1)
+
+
+def margin_l1_loss(inpt, target, m_plus=0.9, m_minus=0.1,lambd=0.5, reduction='elementwise_mean'):
+    byte = torch.ones_like(inpt).type(ByteTensor)
+    batch_size = target.size(0)
+    byte[torch.arange(0, batch_size).type(LongTensor),target] = 0
+    if reduction == 'elementwise_mean':
+        return (torch.sum(F.relu(m_plus - inpt.gather(1, target.unsqueeze(1))))\
+               + lambd * torch.sum(F.relu(inpt[byte] - m_minus))) / batch_size
+    elif reduction == 'sum':
+        return (torch.sum(F.relu(m_plus - inpt.gather(1, target.unsqueeze(1)))) \
+                + lambd * torch.sum(F.relu(inpt[byte] - m_minus)))
+    elif reduction == 'none':
+        return (F.relu(m_plus - inpt.gather(1, target.unsqueeze(1))))[:,0] + \
+               lambd * torch.sum(F.relu(inpt[byte] - m_minus).view(batch_size, -1), dim=1)
+
+
+def multi_margin_loss(inpt, target, p=1, margin=1, reduction='elementwise_mean'):
+    byte = torch.ones_like(inpt).type(ByteTensor)
+    batch_size = inpt.size(0)
+    class_num = inpt.size(1)
+    byte[torch.arange(0, batch_size).type(LongTensor),target] = 0
+    n_inpt = inpt[byte].view(batch_size, class_num - 1)
+    if reduction == 'elementwise_mean':
+        return torch.sum(F.relu(margin - inpt.gather(1, target.unsqueeze(1)) + n_inpt) ** p
+                         ) / (class_num * batch_size)
+    elif reduction == 'sum':
+        return torch.sum(F.relu(margin - inpt.gather(1, target.unsqueeze(1)) + n_inpt) ** p
+                         ) / class_num
+    elif reduction == 'none':
+        return torch.sum(F.relu(margin - inpt.gather(1, target.unsqueeze(1)) + n_inpt) ** p
+                         , dim=1) / class_num
+
+'''
+if __name__ == '__main__':
+    target = torch.arange(0,9)
+    target[-1] = 7
+    y = torch.randn(9,8)
+    print(multi_margin_loss(y, target, reduction = 'none'))
+    print(F.multi_margin_loss(y, target, reduction = 'none'))
+'''
+
+def mean_cross_entropy(inpt, target, reduce=True):
+    if reduce:
+        batch_size = target.size(0)
+        return (- torch.sum(torch.log(inpt.gather(1, target.unsqueeze(1)))) + \
+               torch.sum(torch.log(torch.sum(inpt, dim=1)))) / batch_size
+    else:
+        return - torch.log(inpt.gather(1, target.unsqueeze(1)))[:, 0] + \
+               torch.log(torch.sum(inpt, dim=1))
 
 
 def plt_result(path, iter=1, y_valu='Loss', y_lim=None, picshow=True):
@@ -293,6 +510,11 @@ def plt_result(path, iter=1, y_valu='Loss', y_lim=None, picshow=True):
     else:
         fig.clear()
 
+'''
+if __name__ == '__main__':
+    path = '../../Result/mini/fuzzymeta/5way_5shot_15query'
+    plt_result(path, iter=200, y_valu='Loss')
+'''
 
 def module_test(get_module, testset, on_set, config, classify=True):
     dataset = torch.utils.data.DataLoader(testset, batch_size=config['meta_batch_size'],
@@ -378,6 +600,15 @@ def nega_accu(inpt, target, reduction='elementwise_mean'):
 
 
 def model_output(get_module, model, testset, config):
+    '''
+    if config['lossf'] == 'margin_loss' or \
+       config['lossf'] == 'margin_l1_loss' or \
+       config['lossf'] == 'multi_margin_loss':
+        activator = lambda x:x
+    elif config['lossf'] == 'cross_entropy':
+        activator = nn.Softmax(dim=2)
+    '''
+
     dataset = torch.utils.data.DataLoader(testset, batch_size=config['meta_batch_size'],
                                           shuffle=False, num_workers=8)
     load_path = os.path.join(config['save_path'], model)
@@ -397,8 +628,12 @@ def model_output(get_module, model, testset, config):
         while i < batch_size:
             y = metanet.net(feata[i:i+parall_num], labela[i:i+parall_num],
                             featb[i:i+parall_num]).detach()
+            #ys.append(activator(y))
             ys.append(y)
             i += parall_num
+
+        #y = metanet.net(feata, labela, featb).detach()
+        #ys.append(activator(y))
 
         if itr >= max_inter:
             break
@@ -412,8 +647,12 @@ def model_output(get_module, model, testset, config):
 def calculate_result(y_total, l_total, on_set, config, classify=True, name='', pattern='None'):
     if config['lossf'] == 'margin_loss':
         lossf = margin_loss
+    elif config['lossf'] == 'margin_l1_loss':
+        lossf = margin_l1_loss
+    elif config['lossf'] == 'multi_margin_loss':
+        lossf = multi_margin_loss
     elif config['lossf'] == 'cross_entropy':
-        lossf = F.cross_entropy
+        lossf = log_nnl if pattern != 'WE_un_unit' else F.cross_entropy
 
     y_size = list(y_total.size())
     y_size = [y_size[0] * y_size[1]] + y_size[2:]
@@ -447,10 +686,15 @@ def calculate_result(y_total, l_total, on_set, config, classify=True, name='', p
 
 
 def ensembles_test(get_module, testset, on_set, config, classify=True, load_y=False,  pattern='None'):
-    if config['lossf'] == 'margin_loss':
+    if config['lossf'] == 'margin_loss' or \
+                    config['lossf'] == 'margin_l1_loss' or \
+                    config['lossf'] == 'multi_margin_loss':
         activator = lambda x: x
     elif config['lossf'] == 'cross_entropy':
-        activator = nn.Softmax(dim=2)
+        if pattern == 'WE_un_unit':
+            activator = lambda x: x
+        else:
+            activator = nn.Softmax(dim=2)
 
     # get model name for file
     with open(os.path.join(config['save_path'], 'model_bestn.txt'), "r") as log:
@@ -501,14 +745,33 @@ def ensembles_test(get_module, testset, on_set, config, classify=True, load_y=Fa
         # get output of each model
         y_total = y_totals.mean(0)
         printl(str(models))
+    elif pattern == 'WE' or pattern == 'WE_un_unit' \
+            or pattern == 'WESA' or pattern == 'WEDE':
+        with open(os.path.join(config['save_path'], 'WE.pkl'), 'rb') as f:
+            weights = pickle.load(f)
+        y_total = torch.sum(y_totals * weights, dim=0)
+        printl(str([m + ': %0.4f' % float(w) for m, w in zip(models, weights.view(-1).cpu())]))
+    elif pattern[:10] == 'No_down+WE':
+        # get output of each model
+        y_total1 = y_totals.mean(0)
+        with open(os.path.join(config['save_path'], 'WE.pkl'), 'rb') as f:
+            weights = pickle.load(f)
+        y_total2 = torch.sum(y_totals * weights, dim=0)
+        printl(str([m + ': %0.4f' % float(w) for m, w in zip(models, weights.view(-1).cpu())]))
 
     del y_totals
     gc.collect()
 
     # calculate ensemble result
-    if pattern == 'None' or pattern == 'No_down':
+    if pattern == 'None' or pattern == 'No_down' or \
+        pattern == 'WE' or pattern == 'WE_un_unit' or pattern == 'WESA' or pattern == 'WEDE':
         printl('The result of ' + pattern + '.')
         return calculate_result(y_total, l_total, on_set, config, classify, pattern=pattern)
+    elif pattern[:10] == 'No_down+WE':
+        printl('The result of No_down.')
+        calculate_result(y_total1, l_total, on_set, config, classify, pattern=pattern)
+        printl('The result of WE.')
+        return calculate_result(y_total2, l_total, on_set, config, classify, pattern=pattern)
 
 
 def ensembles_val(get_module, testset, config, classify=True, load_y=False, pattern='None'):
@@ -519,7 +782,9 @@ def ensembles_val(get_module, testset, config, classify=True, load_y=False, patt
               for i in range(-config['len_test'] + 1, 1)]
     printl('pattern=' + pattern)
 
-    if config['lossf'] == 'margin_loss':
+    if config['lossf'] == 'margin_loss' or \
+                    config['lossf'] == 'margin_l1_loss' or \
+                    config['lossf'] == 'multi_margin_loss':
         activator = lambda x: x
     elif config['lossf'] == 'cross_entropy':
         activator = nn.Softmax(dim=2)
@@ -592,15 +857,29 @@ def ensembles_val(get_module, testset, config, classify=True, load_y=False, patt
     else:
         info = models, bestn, means, stds, ci95s
 
-    if pattern == 'None' or pattern == 'No_down':
+    if pattern == 'None' or pattern == 'No_down' or pattern[:10] == 'No_down+WE':
         top_ensemble(config, info, on_set, y_totals, l_total, classify, pattern)
+    elif pattern == 'WE' or pattern == 'WE_un_unit' or \
+          pattern == 'WESA' or pattern == 'WEDE':
+        # print best result of one model
+        printl('Iter%d is the best accub_val or loss_val: ' % bestn[0])
+        printl(models[0] + ' loss on ' + on_set + ': mean=%.6f, std=%.6f, ci95=%.6f' % (
+            means[0], stds[0], ci95s[0]))
+        if classify:
+            printl(models[0] + ' accu on ' + on_set + ': mean=%.6f, std=%.6f, ci95=%.6f' % (
+                mean_accus[0], std_accus[0], ci95_accus[0]))
+        # calculate weight ensemble
+        weight_ensemble(config, models, on_set, y_totals, l_total, classify, pattern)
 
 
 def top_ensemble(config, info, on_set, y_totals, l_total, classify, pattern):
-    if config['lossf'] == 'margin_loss':
+    if config['lossf'] == 'margin_loss' or \
+                    config['lossf'] == 'margin_l1_loss' or \
+                    config['lossf'] == 'multi_margin_loss':
         activator = lambda x: x
     elif config['lossf'] == 'cross_entropy':
         activator = nn.Softmax(dim=2)
+    #y_totals = [activator(y_total) for y_total in y_totals]
 
     if classify:
         models, bestn, means, stds, ci95s, mean_accus, std_accus, ci95_accus = info
@@ -630,6 +909,12 @@ def top_ensemble(config, info, on_set, y_totals, l_total, classify, pattern):
                     continue
                 else:
                     models_no_down.append(models[i])
+            if pattern[:10] == 'No_down+WE':
+                if mean_accu < mean_accus_e[-1]:
+                    continue
+                else:
+                    y_totals_best.append(y_total)
+                    models_no_down.append(models[i])
             mean_accus_e.append(mean_accu)
             std_accus_e.append(std_accu)
             ci95_accus_e.append(ci95_accu)
@@ -639,6 +924,12 @@ def top_ensemble(config, info, on_set, y_totals, l_total, classify, pattern):
                 if mean > means_e[-1]:
                     continue
                 else:
+                    models_no_down.append(models[i])
+            if pattern[:10] == 'No_down+WE':
+                if mean > means_e[-1]:
+                    continue
+                else:
+                    y_totals_best.append(y_total)
                     models_no_down.append(models[i])
         means_e.append(mean)
         stds_e.append(std)
@@ -663,7 +954,7 @@ def top_ensemble(config, info, on_set, y_totals, l_total, classify, pattern):
         printl(models[0] + ' accu on ' + on_set + ': mean=%.6f, std=%.6f, ci95=%.6f' % (
             mean_accus[0], std_accus[0], ci95_accus[0]))
 
-    if pattern == 'No_down':
+    if pattern == 'No_down' or pattern[:10] == 'No_down+WE':
         best_e = len(models_no_down)
         models = models_no_down
         printl('First%d is the number of models used in ensembles: ' % best_e)
@@ -682,6 +973,10 @@ def top_ensemble(config, info, on_set, y_totals, l_total, classify, pattern):
         printl(' accu on ' + on_set + ': mean=%.6f, std=%.6f, ci95=%.6f' % (
             mean_accus_e[best_e - 1], std_accus_e[best_e - 1], ci95_accus_e[best_e - 1]))
 
+    # calculate weight ensemble
+    if pattern[:10] == 'No_down+WE':
+        weight_ensemble(config, models_no_down, on_set, y_totals_best, l_total, classify, pattern)
+
     # save file
     with open(os.path.join(config['save_path'], 'model_bestn.txt'), "w") as log:
         for model in models[:best_e]:
@@ -698,11 +993,351 @@ def top_ensemble(config, info, on_set, y_totals, l_total, classify, pattern):
     np.save(config['logdir'][:-4], save_block)
 
     # draw curve
-    if classify:
-        plt_ensembles(config['logdir'][:-4], mean_accus_e, y_valu='Accuracy', picshow=config['picshow'])
-    else:
-        plt_ensembles(config['logdir'][:-4], means_e, y_valu='Loss', picshow=config['picshow'])
+    # if classify:
+    #     plt_ensembles(config['logdir'][:-4], mean_accus_e, y_valu='Accuracy', picshow=config['picshow'])
+    # else:
+    #     plt_ensembles(config['logdir'][:-4], means_e, y_valu='Loss', picshow=config['picshow'])
 
+
+def weight_ensemble(config, models, on_set, y_totals, l_total, classify, pattern):
+    if config['lossf'] == 'margin_loss':
+        lossf = margin_loss
+    elif config['lossf'] == 'margin_l1_loss':
+        lossf = margin_l1_loss
+    elif config['lossf'] == 'multi_margin_loss':
+        lossf = multi_margin_loss
+    elif config['lossf'] == 'cross_entropy':
+        if pattern == 'WE' or pattern[:10] == 'No_down+WE' or \
+            pattern == 'WESA' or pattern == 'WEDE':
+            lossf = log_nnl
+        elif pattern == 'WE_un_unit':
+            lossf = F.cross_entropy
+
+    if config['lossf'] == 'margin_loss' or \
+                    config['lossf'] == 'margin_l1_loss' or \
+                    config['lossf'] == 'multi_margin_loss':
+        activator = lambda x: x
+    elif config['lossf'] == 'cross_entropy':
+        if pattern == 'WE' or pattern[:10] == 'No_down+WE' or \
+            pattern == 'WESA' or pattern == 'WEDE':
+            activator = nn.Softmax(dim=2)
+        elif pattern == 'WE_un_unit':
+            activator = lambda x: x
+
+    y_totals = [activator(y_total) for y_total in y_totals]
+
+    random.seed(1)
+    torch.manual_seed(1)
+    if pattern=='WE' or pattern == 'No_down+WE':
+        we = WeightEnsemble(len(models), lossf, unit=True)
+    elif pattern == 'WE_un_unit':
+        we = WeightEnsemble(len(models), lossf, unit=False)
+    elif pattern == 'WESA':
+        we = WESA(len(models), lossf)
+    elif pattern == 'WEDE' or pattern == 'No_down+WEDE':
+        we = WEDE(len(models), lossf)
+
+    we = we.cuda() if use_cuda else we
+    y_totals = torch.cat([y_total.unsqueeze(0) for y_total in y_totals], dim=0)
+    weights = we(y_totals, l_total)
+
+    # calculate ensembles preformance
+    y_total = torch.sum(y_totals * weights.view(
+                *([-1] + [1] * (y_totals.dim() - 1))), dim=0)
+    del y_totals
+    gc.collect()
+    if classify:
+        mean_e, std_e, ci95_e, mean_accu_e, std_accu_e, ci95_accu_e = \
+            calculate_result(y_total, l_total, on_set, config, classify, 'Weight Ensembles model', pattern=pattern)
+    else:
+        mean_e, std_e, ci95_e = calculate_result(y_total, l_total, on_set, config, classify, pattern=pattern)
+
+    # print result of weight ensembles
+    printl(str([m + ': %0.4f' % float(w) for m, w in zip(models, weights.cpu())]))
+    printl(' loss on ' + on_set + ': means=%.6f, stds=%.6f, ci95=%.6f' % (
+        mean_e, std_e, ci95_e))
+    if classify:
+        printl(' accu on ' + on_set + ': means=%.6f, stds=%.6f, ci95=%.6f' % (
+            mean_accu_e, std_accu_e, ci95_accu_e))
+
+    # save file and curve
+    with open(os.path.join(config['save_path'], 'model_bestn.txt'), "w") as log:
+        for model in models:
+            log.write(model + '\n')
+        log.write('--------\n')
+
+    with open(os.path.join(config['save_path'], 'WE.pkl'), 'wb') as f:
+        pickle.dump(weights, f)
+
+
+class WeightEnsemble(nn.Module):
+    def __init__(self, models_num, lossf, lr=1., unit=True):
+        super(WeightEnsemble, self).__init__()
+        self.models_num = models_num
+        self.lossf = lossf
+        self.weight = Parameter(torch.Tensor(models_num).type(FloatTensor))
+        #self.optim = optim.SGD(self.parameters(), lr=lr, weight_decay=0., momentum=0.9, nesterov=True)
+        self.optim = optim.LBFGS(self.parameters(), lr=lr)
+        if unit:
+            self.get_weight = self.get_unit_weight
+            self.reset_unit()
+        else:
+            self.reset()
+
+    def forward(self, y_totals, l_total, max_iter=5):
+        y_size = list(y_totals.size())
+        y_size = [y_size[0], y_size[1] * y_size[2]] + y_size[3:]
+        y_totals = y_totals.view(*y_size)
+        l_size = list(l_total.size())
+        l_size = [l_size[0] * l_size[1]] + l_size[2:]
+        l_total = l_total.view(*l_size)
+
+        weight_size = [-1] + [1] * (y_totals.dim() - 1)
+
+        batch_size = l_size[0]
+        for itr in range(1, max_iter + 1):
+            i = 0
+            while i < l_size[0]:
+                def get_loss():
+                    global loss
+                    self.optim.zero_grad()
+                    weight = self.get_weight()
+                    y_total = torch.sum(y_totals[:, i:i + batch_size] * weight.view(*weight_size), dim=0)
+                    loss = self.lossf(y_total, l_total[i:i + batch_size])
+                    loss.backward()
+                    return loss
+                self.optim.step(get_loss)
+                #get_loss()
+                #self.optim.step()
+                i += batch_size
+
+            if itr % 1 == 0:
+                printl('[%d]WELoss: %.4f' % (itr, float(loss)))
+        weight = self.get_weight()
+        return weight.view(*([-1] + [1] * y_totals.dim())).data
+
+    def get_weight(self):
+        return self.weight
+
+    def reset(self):
+        #stdv = 1. / math.sqrt(self.models_num)
+        #self.weight.data.uniform_(-stdv, stdv)
+        self.weight.data.fill_(1. / self.models_num)
+
+    def get_unit_weight(self):
+        weight = self.weight ** 2
+        weight /= torch.sum(weight)
+        return weight
+
+    def reset_unit(self):
+        self.weight.data.fill_(1.)
+
+
+class WESA(nn.Module):
+    def __init__(self, models_num, lossf, scale=0.1, alpha=0.99, T=100000., Te=1.):
+        super(WESA, self).__init__()
+        self.models_num = models_num
+        self.lossf = nega_accu if lossf is log_nnl else lossf
+        self.scale = scale
+        self.alpha = alpha
+        self.T = T
+        self.Te = Te
+        self.weight = Variable(torch.Tensor(models_num).type(FloatTensor))
+
+    def forward(self, y_totals, l_total):
+        y_size = list(y_totals.size())
+        y_size = [y_size[0], y_size[1] * y_size[2]] + y_size[3:]
+        y_totals = y_totals.view(*y_size)
+        l_size = list(l_total.size())
+        l_size = [l_size[0] * l_size[1]] + l_size[2:]
+        l_total = l_total.view(*l_size)
+
+        weight_size = [-1] + [1] * (y_totals.dim() - 1)
+
+        T = self.T
+        weight = self.weight
+        self.weight_best = self.weight
+        y_total = torch.sum(y_totals * weight.view(*weight_size), dim=0)
+        loss = float(self.lossf(y_total, l_total))
+        itr = 0
+        while T > self.Te:
+            weight = self.get_new_weight(weight)
+            y_total = torch.sum(y_totals * weight.view(*weight_size), dim=0)
+            loss_new = float(self.lossf(y_total, l_total))
+            if loss_new < loss:
+                self.weight_best = weight
+            elif random.uniform(0., 1.) < np.exp((loss - loss_new) / T):
+                pass
+            else:
+                weight = self.weight
+                continue
+
+            self.weight = weight
+            loss = loss_new
+            T *= self.alpha
+            itr += 1
+            if itr % 100 == 0:
+                printl('[%d]WELoss: %.4f' % (itr, float(loss)))
+        return self.weight_best
+
+    def reset(self):
+        self.weight.fill_(1. / self.models_num)
+
+    def get_new_weight(self, weight):
+        weight = weight + self.scale * torch.randn(self.models_num).cuda()
+        weight = torch.abs(weight)
+        weight /= torch.sum(weight)
+        return weight
+
+
+class WEDE(nn.Module):
+    def __init__(self, models_num, lossf, M=None):
+        super(WEDE, self).__init__()
+        self.models_num = models_num
+        self.M = self.models_num * 10 if M is None else M
+        self.lossf = nega_accu if lossf is log_nnl else lossf
+        self.pop = Variable(torch.Tensor(self.M, models_num).type(FloatTensor))
+        self.reset()
+        self.F_l = 0.1
+        self.F_u = 0.9
+        self.cr_l = 0.1
+        self.cr_u = 0.6
+        #######
+        self.bs = 200
+
+    def forward(self, y_totals, l_total, max_iter=100):
+        y_size = list(y_totals.size())
+        y_size = [1, y_size[0], y_size[1] * y_size[2]] + y_size[3:]
+        y_totals = y_totals.view(*y_size)
+        self.y_size = y_size[2:]
+        l_size = list(l_total.size())
+        l_size = [1, l_size[0] * l_size[1]] + l_size[2:]
+        l_total = l_total.view(*l_size)
+        self.l_size = l_size[1:]
+        self.l_size_dim = len(self.l_size)
+        self.whole_model()
+
+        self.pop_size = [self.models_num] + [1] * (y_totals.dim() - 2)
+        fitness = self.get_fitness(self.pop, y_totals, l_total)
+        bestn = torch.argmin(fitness)
+        self.weight_best = self.pop[bestn].clone()
+        self.fit_best = float(fitness[bestn])
+        for itr in range(1, max_iter + 1):
+            U = self.mc_process(self.pop, fitness)
+            fitness_U = self.get_fitness(U, y_totals, l_total)
+
+            improve_i = fitness_U < fitness
+            self.pop[improve_i] = U[improve_i]
+            fitness[improve_i] = fitness_U[improve_i]
+
+            bestc = torch.argmin(fitness)
+            fit_current = float(fitness[bestc])
+            if fit_current < self.fit_best:
+                self.weight_best = self.pop[bestc].clone()
+                self.fit_best = fit_current
+            if itr % 20 == 0:
+                printl('[%d]WELoss: %f' % (itr, fit_current))
+
+        return self.get_weight(self.weight_best.unsqueeze(0)).view(*([-1] + [1] * (y_totals.dim() - 1))).data
+
+    def batch_model(self):
+        self.batch_size = self.bs
+        self.parall_pop = self.M // 100
+        #self.batch_size2 = self.models_num
+
+    def whole_model(self):
+        self.batch_size = self.l_size[0]
+        self.parall_pop = 10
+        #self.batch_size2 = 30
+
+    def get_weight(self, pop):
+        pop = pop ** 2
+        pop_sum = pop.sum(dim=1, keepdim=True)
+        pop_sum[pop_sum == 0.] = 1.
+        pop = pop / pop_sum
+        pop[(pop_sum == 0.)[:, 0]] = 1. / self.models_num
+        return pop
+
+    def get_fitness(self, pop, y_totals, l_total):
+        if self.batch_size != self.l_size[0]:
+            sample_i = torch.randperm(self.l_size[0])[:self.batch_size]
+            y_totals = y_totals[:,:,sample_i]
+            l_total = l_total[:,sample_i]
+
+        pop_size0 = pop.size(0)
+        pop = self.get_weight(pop)
+
+        y_total = []
+        i = 0
+        while i < pop_size0:
+            # j = 0
+            # y_t = []
+            # while j < self.models_num:
+            #     pop_h = pop[i:i+self.batch_size1, j:j+self.batch_size2]
+            #     pop_h_size = pop_h.size()
+            #     y_t.append(torch.sum(y_totals[:, j:j+self.batch_size2] *
+            #         pop_h.view(pop_h_size[0], pop_h_size[1], *self.pop_size[1:]) , dim=1, keepdim=True))
+            #     j += self.batch_size2
+            # y_total.append(torch.sum(torch.cat(y_t, dim=1),dim=1))
+            pop_h = pop[i:i+self.parall_pop]
+            pop_h_size = pop_h.size()
+            y_total.append(torch.sum(y_totals * pop_h.view(
+                pop_h_size[0], pop_h_size[1], *self.pop_size[1:]),dim=1))
+            i += self.parall_pop
+        y_total = torch.cat(y_total, dim=0)
+        l_total = l_total.expand(pop_size0, *([-1] * self.l_size_dim)).contiguous()
+        fitness = self.lossf(y_total.view(self.batch_size * pop_size0, *self.y_size[1:]),
+                             l_total.view(self.batch_size * pop_size0, *self.l_size[1:]), reduction='none')
+        return fitness.view(pop_size0, -1).mean(1)
+
+    def mc_process(self, pop, fitness):
+        # Mutation
+        f_bmw, pop_i = self.choose_pop(fitness, 3)
+        F = self.F_l + (self.F_u - self.F_l) * (f_bmw[:,1] - f_bmw[:,0]) / (f_bmw[:,2] - f_bmw[:,0])
+        F = F.type(FloatTensor)
+        V = pop[pop_i[:,0]] + F.unsqueeze(-1) * (pop[pop_i[:,1]] - pop[pop_i[:,2]])
+
+        # Crossover
+        F_mean = F.mean()
+        F_min = F.min()
+        F_max = F.max()
+        cr = torch.full((self.M,), self.cr_l).type(FloatTensor)
+        cr_i = F > F_mean
+        cr[cr_i] += (self.cr_u - self.cr_l) * (F[cr_i] - F_min) / (F_max - F_min)
+        U = pop.clone()
+        uniform = torch.Tensor(self.M, self.models_num).type(FloatTensor)
+        uniform.uniform_(0., 1.)
+        U_i = uniform < cr.unsqueeze(-1)
+        U[U_i] = V[U_i]
+        return U
+
+    def choose_pop(self, fitness, n):
+        pop_i = torch.randint(1, self.M, [self.M, n]).type(torch.LongTensor)
+        for i in range(n-1):
+            while 1:
+                indsum = 0
+                for j in range(i+1):
+                    ind = pop_i[:, j:j+1] == pop_i[:, i+1:]
+                    pop_i[:, i+1:][ind] += 1
+                    pop_i[:, i+1:][pop_i[:, i+1:] >= self.M - 1] -= self.M - 2
+                    indsum += ind.sum()
+                if indsum == 0:
+                    break
+        pop_i += torch.arange(0, self.M).unsqueeze(1)
+        pop_i[pop_i >= self.M] -= self.M
+        pop_i = pop_i.type(LongTensor)
+        f_bmw, ind = torch.sort(fitness[pop_i], dim=1)
+        return f_bmw, torch.gather(pop_i,1,ind)
+
+    def reset(self):
+        self.pop.uniform_(0., 1. / self.models_num)
+
+'''
+if __name__ == '__main__':
+    M = 11
+    we = WEDE(10, log_nnl, M)
+    we.mc_process(we.pop, torch.randn(M))
+'''
 
 def plt_ensembles(path, vector, y_valu='Loss', picshow=True):
     len_step = (len(vector) + 1)
@@ -727,6 +1362,11 @@ def plt_ensembles(path, vector, y_valu='Loss', picshow=True):
     else:
         fig.clear()
 
+'''
+if __name__ == '__main__':
+    path = '../../Result/mini/fuzzymeta/5way_5shot_15query/Thu-Oct-25-16-38-40-2018'
+    plt_ensembles(path, np.load(path + '.npy')[3], y_valu='Accuracy')
+'''
 
 class BatchWeight(nn.Module):
 
@@ -812,3 +1452,52 @@ class BatchWeight(nn.Module):
         super(BatchWeight, self)._load_from_state_dict(
             state_dict, prefix, metadata, strict,
             missing_keys, unexpected_keys, error_msgs)
+
+
+class MulLearnable(NFTModule):
+    def __init__(self, alpha=1.):
+        super(MulLearnable, self).__init__()
+        self.alpha = Parameter(torch.Tensor([alpha]))
+    def forward(self, x):
+        return self.alpha * x
+
+
+class MulAddLearnable(NFTModule):
+    def __init__(self, alpha=1., beta=0.):
+        super(MulAddLearnable, self).__init__()
+        self.alpha = Parameter(torch.Tensor([alpha]))
+        self.beta = Parameter(torch.Tensor([beta]))
+    def forward(self, x):
+        return self.alpha * x + self.beta
+
+
+class Param_Enc(nn.Module):
+    def __init__(self, num_features, hidden_size, channels, num_class, nkshot):
+        super(Param_Enc, self).__init__()
+        self.hidden_size = hidden_size
+        self.channels = channels
+        self.num_class = num_class
+        self.nkshot = nkshot
+        self.train_enc = CapsuleShare(num_features * self.nkshot, hidden_size * self.channels // 2, routings=3, retain_grad=True)
+        self.test_enc = CapsuleShare(num_features, hidden_size * self.channels // 2, routings=3, retain_grad=True)
+        self.avg = nn.AvgPool2d(5)
+        self.bn = nn.BatchNorm1d(self.channels, affine=True)
+
+    def forward(self, feata, labela, featb):
+        featb = featb.transpose(0, 1).contiguous()
+        fb_size = list(featb.size())
+        featb = self.avg(featb.view(*([fb_size[0] * fb_size[1]] + fb_size[2:]))
+                         ).view(fb_size[0], fb_size[1], -1).transpose(1, 2).contiguous()
+
+        feata = feata.transpose(0, 1).contiguous()
+        fa_size = list(feata.size())
+        feata = self.avg(feata.view(*([fa_size[0] * fa_size[1]] + fa_size[2:]))).view(fa_size[0], fa_size[1], -1)
+        fa_size = list(feata.size())
+        labela = labela.transpose(0, 1).contiguous()
+        labela, indices = torch.sort(labela, dim=1)
+        feata = torch.gather(feata, 1, indices.view(
+            *([fa_size[0], fa_size[1]] + [1] * len(fa_size[2:]))).expand_as(feata))
+        feata = feata.view(fa_size[0], fa_size[1] // self.num_class, -1).transpose(1, 2).contiguous()
+        hidden = torch.cat([self.train_enc(feata), self.test_enc(featb)], dim=1
+                           ).view(fa_size[0], self.channels, self.hidden_size)
+        return F.relu(self.bn(hidden))
