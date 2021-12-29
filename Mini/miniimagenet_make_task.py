@@ -1,10 +1,5 @@
 #!/usr/bin/python3.6
 
-import sys
-import os
-filepath,_ = os.path.split(os.path.realpath(__file__))
-filepath,_ = os.path.split(filepath)
-sys.path.append(filepath)
 from DataSolver import *
 
 # 5-way 1-shot 1-query
