@@ -3,15 +3,13 @@
 """
 Usage Instructions:
     10-shot sinusoid:
+        python3 sinusoid_e.py --kshot=10 --kquery=10 --train=True --metatrain_iterations=60000
+        python3 sinusoid_e.py --kshot=10 --kquery=10 --train=False --test_or_val=True
+    10-shot sinusoid baselines:
+        python main.py --datasource=sinusoid --logdir=logs/sine/ --pretrain_iterations=70000 --metatrain_iterations=0 --norm=None --update_batch_size=10 --baseline=oracle
+        python main.py --datasource=sinusoid --logdir=logs/sine/ --pretrain_iterations=70000 --metatrain_iterations=0 --norm=None --update_batch_size=10
 
-        python3 sinusoid_e.py --kshot=10 --kquery=10 --inner_num=2 --train=True --metatrain_itr=60000 --model_name=fuzzymeta
-        python3 sinusoid_e.py --kshot=10 --kquery=10 --inner_num=20 --train=False --test_or_val=True --model_name=fuzzymeta
-
-    To run evaluation, use the '--train=False' flag, and the '--test_or_val=False' flag to use the validation set
-    '--test_or_val=True' flag to use the test set.
-
-    Choose the test iteration by '--test_iter=-1', when test on the validation set it would test last '--len_test' models,
-    when test on the test set it would test just one model.
+    To run evaluation, use the '--train=False' flag and the '--test_set=True' flag to use the test set.
 """
 
 import argparse
@@ -29,6 +27,13 @@ from fuzzymeta import *
 from utils import *
 
 
+'''
+if __name__ == '__main__':
+    x = Variable(torch.randn(4,3)).cuda()
+    pw = Part2WholeSine().cuda()
+    print(pw(x))
+'''
+
 def get_sinu_fmeta(config, path=None):
     set_num = 2
     hidden_size = 40
@@ -42,6 +47,33 @@ def get_sinu_fmeta(config, path=None):
                       'len_rules': len_rules, 'weight_size': weight_size,
                       'num_iter': inner_num_train}
             return Part2WholeBW(config)
+
+    '''
+    fnet = FNetParall(param_size=100,
+                      weight_size=(hidden_size, hidden_size),
+                      Rule=Part2WholeSine,
+                      len_rules=2**set_num,
+                      set_num=set_num,
+                      inner_num=config['inner_num'],
+                      inner_lr=config['inner_lr'],
+                      match=CapsuleMatch(1, set_num,(1, hidden_size), retain_grad=False),
+                      layers=(nn.Linear(1, hidden_size),
+                              nn.LayerNorm(hidden_size),
+                              #nn.BatchNorm1d(hidden_size,momentum=1.,track_running_stats=False),
+                              nn.ReLU(),
+                              View(1,1,hidden_size),
+                              Fuzzy2D((1, hidden_size), (1, hidden_size), 1, 1),
+                              nn.LayerNorm(hidden_size),
+                              nn.ReLU(),
+                              Fuzzy2D((1, hidden_size), (1, hidden_size-5), 1, 1),
+                              nn.LayerNorm(hidden_size-5),
+                              View(hidden_size - 5),
+                              #nn.BatchNorm1d(hidden_size-5,momentum=1.,track_running_stats=False),
+                              nn.ReLU(),
+                              #Fuzzy2D((1, hidden_size), (1, 1), 1, 1),
+                              nn.Linear(hidden_size-5, 1)
+                              ))
+    '''
 
     fnet = FNetParall(param_size=100,
                       weight_size=(hidden_size, hidden_size),
@@ -77,7 +109,6 @@ def get_sinu_fmeta(config, path=None):
     return MetaNet(fnet, F.mse_loss, optimf, save_path=config['save_path'], parall_num=config['meta_batch_size'],
                    save_iter=config['save_iter'], print_iter=1000)
 
-
 def get_sinu_maml(config, path=None):
     hidden_size = 40
     inner_num = config['inner_num'] if config['train'] else config['inner_num_test']
@@ -93,7 +124,7 @@ def get_sinu_maml(config, path=None):
                         nn.Linear(hidden_size-5, 1)
                         ))
 
-    amsgrad = True
+    amsgrad = False
     if not config['resume'] and config['train']:
         print_network(mnet, 'mnet')
         printl('meta_batch_size=' + str(config['meta_batch_size']))
@@ -112,23 +143,24 @@ def get_sinu_maml(config, path=None):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="This is pytorch network.")
     parser.add_argument("--baseline", "-bl", help="oracle or None", default=None)
+    parser.add_argument("--pretrain_iterations", "-pi", help="number of pre-training iterations.", default=0, type=int)
     parser.add_argument("--metatrain_itr", "-mi", help="number of metatraining iterations.", default=60000, type=int) # 15k for omniglot, 50k for sinusoid
     parser.add_argument("--meta_batch_size", "-mbs", help="number of tasks sampled per meta-update", default=25, type=int)
     parser.add_argument("--meta_lr", "-ml", help="the base learning rate of the generator", default=0.001, type=float)
-    parser.add_argument("--kshot", "-ks", help="number of examples used for inner gradient update (K for K-shot learning).", default=20, type=int)
-    parser.add_argument("--kquery", "-kq", help="number of examples used for inner test (K for K-query).", default=20, type=int)
+    parser.add_argument("--kshot", "-ks", help="number of examples used for inner gradient update (K for K-shot learning).", default=5, type=int)
+    parser.add_argument("--kquery", "-kq", help="number of examples used for inner test (K for K-query).", default=5, type=int)
     parser.add_argument("--inner_lr", "-ilr", help="step size alpha for inner gradient update.", default=1e-3, type=float)
     parser.add_argument("--inner_num", "-inu", help="number of inner gradient updates during training.", default=2, type=int)
-    parser.add_argument("--inner_num_test", "-int", help="number of inner gradient updates during test.", default=30,type=int)
+    parser.add_argument("--inner_num_test", "-int", help="number of inner gradient updates during test.", default=10,type=int)
 
     ## Logging, saving, and testing options
     parser.add_argument("--logdir", "-ld", help="directory for summaries and checkpoints.",
-                        default='../../Result/sinu')
+                        default='../../../Result/sinu')
     parser.add_argument("--resume", "-rs", help="resume training if there is a model available", default=False, type=ast.literal_eval)
-    parser.add_argument("--train", "-tr", help="True to train, False to test.", default=True, type=ast.literal_eval)
+    parser.add_argument("--train", "-tr", help="True to train, False to test.", default=False, type=ast.literal_eval)
     parser.add_argument("--test_iter", "-ti", help="iteration to load model (-1 for latest model)", default=-1, type=int)
     parser.add_argument("--test_or_val", "-tov",
-                        help="Set to true to test on the the test set, False for the validation set.", default=False, type=ast.literal_eval)
+                        help="Set to true to test on the the test set, False for the validation set.", default=True, type=ast.literal_eval)
     parser.add_argument("--len_test", "-lt",
                         help="The number of models using in test.", default=5, type=int)
     parser.add_argument("--bestn", help="The best n model.", default=1, type=int)
@@ -137,7 +169,7 @@ if __name__ == '__main__':
     parser.add_argument("--resume_path", "-lp", help="path to load model and file.",
                         default='_i4000.pkl')
     parser.add_argument("--model_name", "-mn", help="The name of model used in the task.",
-                        default='fuzzymeta')#'maml')
+                        default='maml')
     config = parser.parse_args().__dict__
 
     tasks_file = str(config['kshot']) + 'shot_' + str(config['kquery']) + 'query'
@@ -145,7 +177,7 @@ if __name__ == '__main__':
     parent_direct = os.path.split(config['logdir'])[0]
     if not os.path.exists(parent_direct):
         os.mkdir(parent_direct)
-
+    
     if not os.path.exists(config['logdir']):
         os.mkdir(config['logdir'])
     config['logdir'] = os.path.join(config['logdir'], config['model_name'])
